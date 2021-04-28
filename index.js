@@ -16,6 +16,8 @@ var Buffer = require('safe-buffer').Buffer
 var debug = require('debug')('cookie-session')
 var Cookies = require('cookies')
 var onHeaders = require('on-headers')
+const zlib = require('zlib');
+const crypto = require('crypto');
 
 /**
  * Module exports.
@@ -47,7 +49,8 @@ function cookieSession (options) {
   // secrets
   var keys = opts.keys
   if (!keys && opts.secret) keys = [opts.secret]
-
+  opts.keys = keys;
+  
   // defaults
   if (opts.overwrite == null) opts.overwrite = true
   if (opts.httpOnly == null) opts.httpOnly = true
@@ -64,7 +67,7 @@ function cookieSession (options) {
     var sess
 
     // for overriding
-    req.sessionOptions = Object.create(opts)
+    req.sessionOptions = Object.assign({}, opts)
 
     // define req.session getter / setter
     Object.defineProperty(req, 'session', {
@@ -92,7 +95,7 @@ function cookieSession (options) {
 
       // create session
       debug('new session')
-      return (sess = Session.create())
+      return (sess = Session.create(null, req.sessionOptions))
     }
 
     function setSession (val) {
@@ -104,7 +107,7 @@ function cookieSession (options) {
 
       if (typeof val === 'object') {
         // create a new session
-        sess = Session.create(val)
+        sess = Session.create(val, req.sessionOptions)
         return sess
       }
 
@@ -129,6 +132,7 @@ function cookieSession (options) {
         }
       } catch (e) {
         debug('error saving session %s', e.message)
+        console.log('error saving session', e);
       }
     })
 
@@ -161,8 +165,12 @@ function Session (ctx, obj) {
  * @private
  */
 
-Session.create = function create (obj) {
+Session.create = function create (obj, options) {
   var ctx = new SessionContext()
+  
+  if (options) {
+    ctx.options = options;
+  }
   return new Session(ctx, obj)
 }
 
@@ -171,13 +179,16 @@ Session.create = function create (obj) {
  * @private
  */
 
-Session.deserialize = function deserialize (str) {
+Session.deserialize = function deserialize (str, options) {
   var ctx = new SessionContext()
-  var obj = decode(str)
+  var obj = decode(str, options.keys[0])
 
   ctx._new = false
-  ctx._val = str
+  ctx._val = JSON.stringify(obj);
 
+  if (options) {
+    ctx.options = options;
+  }
   return new Session(ctx, obj)
 }
 
@@ -187,7 +198,7 @@ Session.deserialize = function deserialize (str) {
  */
 
 Session.serialize = function serialize (sess) {
-  return encode(sess)
+  return encode(sess, sess._ctx.options.keys[0]);
 }
 
 /**
@@ -199,7 +210,7 @@ Session.serialize = function serialize (sess) {
 
 Object.defineProperty(Session.prototype, 'isChanged', {
   get: function getIsChanged () {
-    return this._ctx._new || this._ctx._val !== Session.serialize(this)
+    return this._ctx._new || this._ctx._val !== JSON.stringify(this);
   }
 })
 
@@ -248,8 +259,25 @@ function SessionContext () {
  * @private
  */
 
-function decode (string) {
-  var body = Buffer.from(string, 'base64').toString('utf8')
+function decode (string, key) {
+  var body = Buffer.from(string, 'base64');
+  
+  if (key) {
+    try {
+      const iv = body.slice(body.length - 16);
+      const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+      body = Buffer.concat([decipher.update(body.slice(0, body.length - 16)), decipher.final()])      
+    } catch (err) {
+      console.log(err);
+      return {};
+    }
+  }
+  
+  try {
+    body = zlib.inflateRawSync(body).toString('utf8');    
+  } catch (err) {
+    console.log(err);
+  }
   return JSON.parse(body)
 }
 
@@ -261,9 +289,31 @@ function decode (string) {
  * @private
  */
 
-function encode (body) {
-  var str = JSON.stringify(body)
-  return Buffer.from(str).toString('base64')
+function encode (body, key) {
+  try {
+    var str = zlib.deflateRawSync(JSON.stringify(body));
+  } catch (err) {
+    console.log(err);
+  }  
+
+  if (key) {
+    try {
+      const iv = crypto.randomBytes(16);
+      const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+      str = Buffer.concat([cipher.update(str), cipher.final(), iv])      
+    } catch (err) {
+      console.log(err);
+      return '';
+    }
+  }
+  
+  str = Buffer.from(str).toString('base64');
+  
+  // As it's base64 encoded - .length will be OK
+  if (str.length > 4093) {
+    console.log('Warning! Session cookie is too large (', str.length, '), data:', JSON.stringify(body));
+  }
+  return str;
 }
 
 /**
@@ -281,7 +331,7 @@ function tryGetSession (cookies, name, opts) {
   debug('parse %s', str)
 
   try {
-    return Session.deserialize(str)
+    return Session.deserialize(str, opts)
   } catch (err) {
     return undefined
   }
